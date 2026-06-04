@@ -1,0 +1,206 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+using UnityEngine;
+using UnityEngine.Rendering;
+using Newtonsoft.Json;
+
+/// <summary>
+/// Low-latency camera sender for ML-Agents (50 Hz / FixedUpdate).
+///
+/// Key design:
+///   - AsyncGPUReadback: no GPU stall, readback completes next frame
+///   - Raw RGB24 bytes: no JPEG encode/decode overhead
+///   - TCP_NODELAY: disables Nagle batching (was adding up to 200ms!)
+///   - Single-slot "latest frame only": old frames are discarded, never queued
+///   - Send runs on a background thread so FixedUpdate is never blocked
+///   - Resolution comes from the camera itself — no manual width/height needed
+///
+/// Attach to the same GameObject as the Camera you want to stream.
+/// </summary>
+[RequireComponent(typeof(Camera))]
+public class CameraStreamer : MonoBehaviour
+{
+    [Header("Server")]
+    public string serverIP = "127.0.0.1";
+    public int serverPort = 9999;
+
+    // ── internals ────────────────────────────────────────────────────
+    private Camera _cam;
+    private RenderTexture _rt;
+    private int _camWidth;
+    private int _camHeight;
+
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private Thread _sendThread;
+    private volatile bool _running;
+
+    // Single-slot latest-frame store (write: main thread, read: send thread)
+    private byte[] _latestFrame;
+    private bool _frameReady;
+    private readonly object _frameLock = new object();
+    private readonly SemaphoreSlim _frameSem = new SemaphoreSlim(0, 1);
+
+    // Pre-allocated header buffer
+    private readonly byte[] _header = new byte[4];
+
+    // Frame byte count derived from camera resolution
+    private int _frameBytes;
+
+    void Start()
+    {
+        _cam = GetComponent<Camera>();
+
+        // Use the camera's own pixel resolution — whatever is set on the Camera component
+        // (controlled by the camera's targetTexture or the screen resolution if none is set)
+        _camWidth = _cam.pixelWidth;
+        _camHeight = _cam.pixelHeight;
+
+        // RenderTexture at the camera's native resolution, no downsample
+        _rt = new RenderTexture(_camWidth, _camHeight, 0, RenderTextureFormat.ARGB32);
+        _rt.Create();
+
+        // W * H * 3 channels (RGB24)
+        _frameBytes = _camWidth * _camHeight * 3;
+
+        Connect();
+    }
+
+    // FixedUpdate runs at the physics rate (default 50 Hz in Unity)
+    void FixedUpdate()
+    {
+        if (!_running) return;
+        CaptureAsync();
+    }
+
+    void OnDestroy() => Disconnect();
+
+    // ── capture ───────────────────────────────────────────────────────
+
+    private void CaptureAsync()
+    {
+        // Render the camera into our RenderTexture this frame
+        _cam.targetTexture = _rt;
+        _cam.Render();
+        _cam.targetTexture = null;
+
+        // Request async GPU readback — callback fires next frame, no stall
+        AsyncGPUReadback.Request(_rt, 0, TextureFormat.RGB24, OnReadbackComplete);
+    }
+
+    private void OnReadbackComplete(AsyncGPUReadbackRequest req)
+    {
+        if (req.hasError || !_running) return;
+
+        // GetData<byte>() is a zero-copy NativeArray view — copy to managed once
+        var data = req.GetData<byte>();
+        byte[] frame = new byte[_frameBytes];
+        data.CopyTo(frame);
+
+        // Store as latest frame; signal send thread
+        lock (_frameLock)
+        {
+            _latestFrame = frame;
+            if (!_frameReady)
+            {
+                _frameReady = true;
+                // Only release if semaphore isn't already signalled (avoid double-release)
+                if (_frameSem.CurrentCount == 0)
+                    _frameSem.Release();
+            }
+            // If _frameReady was already true, we just overwrote _latestFrame —
+            // send thread will pick up the newer frame, old one is dropped.
+        }
+    }
+
+    // ── networking ────────────────────────────────────────────────────
+
+    private void Connect()
+    {
+        try
+        {
+            _client = new TcpClient();
+
+            // TCP_NODELAY: disable Nagle's algorithm — critical for low latency
+            // Without this, small packets are held up to 200ms waiting to be batched
+            _client.NoDelay = true;
+
+            // Generous send buffer so the background thread never blocks on the socket
+            _client.SendBufferSize = _frameBytes * 4;
+
+            _client.Connect(serverIP, serverPort);
+            _stream = _client.GetStream();
+
+            // Send a one-time 8-byte handshake: width (4 bytes BE) + height (4 bytes BE)
+            // Python uses this to know the frame dimensions without any config file
+            byte[] handshake = new byte[8];
+            handshake[0] = (byte)(_camWidth >> 24); handshake[1] = (byte)(_camWidth >> 16);
+            handshake[2] = (byte)(_camWidth >> 8); handshake[3] = (byte)(_camWidth);
+            handshake[4] = (byte)(_camHeight >> 24); handshake[5] = (byte)(_camHeight >> 16);
+            handshake[6] = (byte)(_camHeight >> 8); handshake[7] = (byte)(_camHeight);
+            _stream.Write(handshake, 0, 8);
+
+            _running = true;
+            _sendThread = new Thread(SendLoop) { IsBackground = true, Name = "CameraSendThread" };
+            _sendThread.Start();
+
+            Debug.Log($"[CameraSender] Connected to {serverIP}:{serverPort} | frame={_camWidth}x{_camHeight} RGB24 ({_frameBytes} bytes)");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[CameraSender] Connection failed: {e.Message}");
+        }
+    }
+
+    private void Disconnect()
+    {
+        _running = false;
+        _frameSem.Release();      // unblock send thread if it's waiting
+        _stream?.Close();
+        _client?.Close();
+        _sendThread?.Join(500);
+        _rt?.Release();
+    }
+
+    // ── background send thread ────────────────────────────────────────
+
+    private void SendLoop()
+    {
+        while (_running)
+        {
+            // Block until a new frame is available
+            _frameSem.Wait();
+            if (!_running) break;
+
+            byte[] frame;
+            lock (_frameLock)
+            {
+                frame = _latestFrame;
+                _frameReady = false;
+            }
+
+            if (frame == null) continue;
+
+            try
+            {
+                // 4-byte big-endian length header
+                int len = frame.Length;
+                _header[0] = (byte)(len >> 24);
+                _header[1] = (byte)(len >> 16);
+                _header[2] = (byte)(len >> 8);
+                _header[3] = (byte)(len);
+
+                _stream.Write(_header, 0, 4);
+                _stream.Write(frame, 0, len);
+                // No Flush() needed — TCP_NODELAY sends immediately
+            }
+            catch (Exception e)
+            {
+                if (_running)
+                    Debug.LogError($"[CameraSender] Send error: {e.Message}");
+                _running = false;
+            }
+        }
+    }
+}

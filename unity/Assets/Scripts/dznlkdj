@@ -1,0 +1,1004 @@
+using UnityEngine;
+using Unity.MLAgents;
+using Unity.MLAgents.Sensors;
+using Unity.MLAgents.Actuators;
+using System.Collections.Generic;
+
+/// <summary>
+/// Optimized CarAgent for ML-Agents smooth driving.
+/// Key design principles:
+///   - All per-step rewards scaled to ~0.001–0.005 range
+///   - Terminal rewards scaled to ~1.0–5.0 range
+///   - No hard distance thresholds — all smooth Lerp/curves
+///   - MaxStep = 3000 prevents stuck episodes
+///   - Single continuous target-speed curve for obstacle braking
+///   - No reward stacking (no overlapping distance blocks)
+/// </summary>
+public class CarAgent : Agent
+{
+    // ── Components ─────────────────────────────────────────────────────────
+    private Rigidbody rb;
+    private RayPerceptionSensorComponent3D raySensor;
+    private RayDetail rayDetail;
+
+    // ── Wheel Colliders ────────────────────────────────────────────────────
+    [SerializeField] private WheelCollider frontLeftWheelCollider, frontRightWheelCollider;
+    [SerializeField] private WheelCollider rearLeftWheelCollider, rearRightWheelCollider;
+
+    // ── Wheel Transforms ───────────────────────────────────────────────────
+    [SerializeField] private Transform frontLeftWheelTransform, frontRightWheelTransform;
+    [SerializeField] private Transform rearLeftWheelTransform, rearRightWheelTransform;
+
+    // ── Tunable Physics ────────────────────────────────────────────────────
+    [SerializeField] private float motorForce = 1500f;
+    [SerializeField] private float maxSteerAngle = 30f;
+    [SerializeField] private float breakForce = 4000f;
+
+    // ── Path ───────────────────────────────────────────────────────────────
+    [SerializeField] private TestPath pathProvider;
+    private List<Waypoint> path;
+    private int currentWaypointIndex = 0;
+    private float lastDistanceToWaypoint = 0f;
+
+    // ── State ──────────────────────────────────────────────────────────────
+    private float currentSteerAngle;
+    private float previousSteerAngle;
+    private float previousSpeed;
+    private bool redLightViolated = false;
+
+    private Vector3 startPosition;
+    private Quaternion startRotation;
+
+    // ── Constants (tune here, not scattered in code) ───────────────────────
+    private const int MAX_STEPS = 3000;   // prevents stuck episodes
+    private const float STOP_DISTANCE = 7f;     // target stop distance from obstacle
+    private const float SLOW_START_DISTANCE = 35f;    // begin slowing at this distance
+    private const float MAX_SPEED = 15f;    // speed cap
+    private const float WAYPOINT_REACH_DIST = 6f;     // waypoint capture radius
+    private const float MAX_WAYPOINT_DIST = 36f;    // abandon episode if too far off path
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // LIFECYCLE
+    // ═══════════════════════════════════════════════════════════════════════
+
+    public override void Initialize()
+    {
+        rb = GetComponent<Rigidbody>();
+        raySensor = GetComponent<RayPerceptionSensorComponent3D>();
+        rayDetail = GetComponent<RayDetail>();
+        startPosition = transform.localPosition;
+        startRotation = transform.localRotation;
+        MaxStep = MAX_STEPS;
+    }
+
+    public override void OnEpisodeBegin()
+    {
+        // Reset physics
+        rb.velocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+
+        // Reset state
+        previousSpeed = 0f;
+        previousSteerAngle = 0f;
+        currentSteerAngle = 0f;
+        redLightViolated = false;
+
+        // Reset wheels (prevents carry-over torque)
+        ResetWheelTorques();
+
+        // Set path and spawn position
+        SetPath();
+
+        rayDetail.ResetState();
+    }
+
+    private void SetPath()
+    {
+        if (pathProvider != null)
+        {
+            pathProvider.GetFixedPath();
+            path = pathProvider.CurrentPath;
+            currentWaypointIndex = 0;
+        }
+
+        if (path != null && path.Count > 1)
+        {
+            Vector3 startPos = path[0].transform.position;
+            Vector3 nextPos = path[1].transform.position;
+            Vector3 direction = (nextPos - startPos).normalized;
+
+            transform.position = startPos;
+            transform.rotation = Quaternion.LookRotation(direction, Vector3.up);
+        }
+        else
+        {
+            transform.localPosition = startPosition;
+            transform.localRotation = startRotation;
+        }
+
+        lastDistanceToWaypoint = path != null && path.Count > 0
+            ? Vector3.Distance(transform.position, path[0].transform.position)
+            : 0f;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // OBSERVATIONS  (14 total)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    public override void CollectObservations(VectorSensor sensor)
+    {
+        float speed = Vector3.Dot(rb.velocity, transform.forward);
+
+        // 1. Normalised forward speed [-1, 1]
+        sensor.AddObservation(Mathf.Clamp(speed / 20f, -1f, 1f));
+
+        // 2. Normalised steer angle
+        sensor.AddObservation(currentSteerAngle / maxSteerAngle);
+
+        // 3. Lane centre offset
+        sensor.AddObservation(LaneDetail.LaneCenter(raySensor));
+
+        // 4–7. Hit object type (one-hot)
+        var (hitObject, dist, trafficLight) = rayDetail.GetRayInfo();
+        sensor.AddObservation(hitObject == RayDetail.HitGameObject.None ? 1 : 0);
+        sensor.AddObservation(hitObject == RayDetail.HitGameObject.TrafficLight ? 1 : 0);
+        sensor.AddObservation(hitObject == RayDetail.HitGameObject.Human ? 1 : 0);
+        sensor.AddObservation(hitObject == RayDetail.HitGameObject.Car ? 1 : 0);
+
+        // 8. Normalised distance to hit [0, 1]
+        sensor.AddObservation(dist);
+
+        // 9–12. Traffic light state (one-hot)
+        sensor.AddObservation(trafficLight == TrafficLight.None ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Red ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Yellow ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Green ? 1 : 0);
+
+        // 13–14. Local waypoint direction
+        if (path != null && currentWaypointIndex < path.Count)
+        {
+            Vector3 localTarget = transform.InverseTransformPoint(path[currentWaypointIndex].transform.position);
+            sensor.AddObservation(Mathf.Clamp(localTarget.x / 20f, -1f, 1f));
+            sensor.AddObservation(Mathf.Clamp(localTarget.z / 20f, -1f, 1f));
+        }
+        else
+        {
+            sensor.AddObservation(0f);
+            sensor.AddObservation(0f);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ACTIONS & REWARDS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    public override void OnActionReceived(ActionBuffers actions)
+    {
+        // ── Apply controls ─────────────────────────────────────────────────
+        float steerInput = actions.ContinuousActions[0];
+        float accelerationInput = actions.ContinuousActions[1];
+        float brakeInput = actions.ContinuousActions[2];
+
+        HandleMotor(accelerationInput, brakeInput);
+        HandleSteering(steerInput);
+        UpdateWheels();
+
+        // ── Gather state ───────────────────────────────────────────────────
+        float speed = Vector3.Dot(rb.velocity, transform.forward);
+        float laneCenter = LaneDetail.LaneCenter(raySensor);
+        var (hitObject, dist, trafficLight) = rayDetail.GetRayInfo();
+        float distance = dist * 40f; // unnormalise to metres
+
+        // ── Survival reward (makes staying alive worth more than suicide reset)
+        AddReward(0.0005f);
+
+        // ── TERMINAL: Flip ─────────────────────────────────────────────────
+        if (transform.up.y < 0.5f)
+        {
+            AddReward(-1.0f);
+            EndEpisode();
+            return;
+        }
+
+        // ── TERMINAL: Red light violation ──────────────────────────────────
+        if (redLightViolated)
+        {
+            redLightViolated = false;
+            AddReward(-3.0f);
+            EndEpisode();
+            return;
+        }
+
+        // ── WAYPOINT NAVIGATION ────────────────────────────────────────────
+        RewardWaypointNavigation(speed, laneCenter, hitObject, distance);
+        if (episodeInterrupted) return; // EndEpisode was called inside
+
+        // ── SPEED ──────────────────────────────────────────────────────────
+        RewardSpeed(speed, hitObject, distance);
+
+        // ── STEERING SMOOTHNESS ────────────────────────────────────────────
+        RewardSteeringSmoothness(laneCenter);
+
+        // ── LANE CENTERING ─────────────────────────────────────────────────
+        AddReward(0.002f * Mathf.Exp(-10f * laneCenter * laneCenter));
+
+        // ── OBSTACLE BRAKING ───────────────────────────────────────────────
+        RewardObstacleBraking(speed, hitObject, distance);
+
+        // ── NPC PROXIMITY ──────────────────────────────────────────────────
+        RewardNpcProximity(hitObject, distance);
+
+        // ── TRAFFIC LIGHT ──────────────────────────────────────────────────
+        RewardTrafficLight(speed, trafficLight, distance);
+
+        // ── Store for next step ────────────────────────────────────────────
+        previousSpeed = speed;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // REWARD MODULES
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // Flag to detect EndEpisode calls inside sub-methods
+    private bool episodeInterrupted = false;
+
+    private void RewardWaypointNavigation(float speed, float laneCenter,
+                                          RayDetail.HitGameObject hitObject, float distance)
+    {
+        episodeInterrupted = false;
+        if (path == null || currentWaypointIndex >= path.Count) return;
+
+        Vector3 target = path[currentWaypointIndex].transform.position;
+        float distanceToWaypoint = Vector3.Distance(transform.position, target);
+
+        // Too far off path — episode failed
+        if (distanceToWaypoint > MAX_WAYPOINT_DIST)
+        {
+            AddReward(-1.0f);
+            EndEpisode();
+            episodeInterrupted = true;
+            return;
+        }
+
+        // Progress toward waypoint — suppressed if obstacle is close
+        bool obstacleClose = hitObject != RayDetail.HitGameObject.None && distance < 20f;
+        if (!obstacleClose)
+        {
+            float delta = lastDistanceToWaypoint - distanceToWaypoint;
+            AddReward(0.05f * delta); // scaled: ~0.05 per metre progress
+        }
+
+        // Heading alignment
+        Vector3 toTarget = (target - transform.position).normalized;
+        float angle = Vector3.Angle(transform.forward, toTarget);
+        AddReward(-0.0005f * (angle / 180f));
+
+        // Corner speed penalty — slow down for sharp turns near waypoint
+        if (angle > 30f && distanceToWaypoint < 10f)
+        {
+            float expectedSpeed = Mathf.Lerp(5f, 1f, (angle - 30f) / 60f);
+            if (speed > expectedSpeed)
+                AddReward(-0.002f * (speed - expectedSpeed));
+        }
+
+        // Waypoint captured
+        if (distanceToWaypoint < WAYPOINT_REACH_DIST)
+        {
+            AddReward(0.5f);
+            currentWaypointIndex++;
+
+            if (currentWaypointIndex >= path.Count)
+            {
+                AddReward(5.0f); // path complete!
+                EndEpisode();
+                episodeInterrupted = true;
+                return;
+            }
+        }
+
+        lastDistanceToWaypoint = distanceToWaypoint;
+    }
+
+    private void RewardSpeed(float speed, RayDetail.HitGameObject hitObject, float distance)
+    {
+        bool obstacleClose = hitObject != RayDetail.HitGameObject.None && distance < SLOW_START_DISTANCE;
+
+        if (!obstacleClose)
+        {
+            // Reward driving at a healthy speed
+            AddReward(Mathf.Clamp(speed / 20f, 0f, 1f) * 0.002f);
+            if (speed > 2f) AddReward(0.0005f);
+        }
+
+        // Hard speed cap penalty
+        if (speed > MAX_SPEED)
+            AddReward(-0.005f * (speed - MAX_SPEED));
+    }
+
+    private void RewardSteeringSmoothness(float laneCenter)
+    {
+        float steerChange = Mathf.Abs(currentSteerAngle - previousSteerAngle);
+        previousSteerAngle = currentSteerAngle;
+
+        // Only penalise jerky steering when NOT near lane edge (forgive correction steering)
+        float laneFactor = 1f - Mathf.Exp(-5f * Mathf.Abs(laneCenter));
+        float steerPenalty = steerChange / maxSteerAngle * laneFactor;
+        AddReward(-0.001f * steerPenalty);
+    }
+
+    private void RewardObstacleBraking(float speed, RayDetail.HitGameObject hitObject, float distance)
+    {
+        if (hitObject == RayDetail.HitGameObject.None || TrafficLight.Green) return;
+
+        // Single smooth target-speed curve: 10 m/s at SLOW_START_DISTANCE → 0 at STOP_DISTANCE
+        float t = Mathf.InverseLerp(STOP_DISTANCE, SLOW_START_DISTANCE, distance);
+        float targetSpeed = Mathf.Lerp(0f, 10f, t);
+        float speedError = speed - targetSpeed;
+
+        if (speedError > 0f)
+        {
+            // Going faster than ideal — penalise proportionally
+            AddReward(-0.01f * Mathf.Clamp(speedError / 10f, 0f, 1f));
+        }
+        else
+        {
+            // Matching or under ideal speed — small reward
+            AddReward(0.002f * Mathf.Exp(-Mathf.Abs(speedError)));
+        }
+
+        // Correct stop in the stop zone
+        if (distance < STOP_DISTANCE)
+        {
+            AddReward(speed > 0.3f ? -0.05f : 0.01f);
+        }
+
+        // Smooth braking reward — only when actually needed and moving
+        float deceleration = previousSpeed - speed;
+        if (deceleration > 0f && deceleration < 2f && speed > 0.5f && distance < SLOW_START_DISTANCE)
+        {
+            float urgency = 1f - t; // more reward the closer you are
+            AddReward(0.001f * urgency);
+        }
+
+        // Harsh braking penalty
+        if (deceleration > 2.5f)
+            AddReward(-0.005f * Mathf.Clamp((deceleration - 2.5f) / 3f, 0f, 1f));
+
+        // Early stop penalty — don't stop when still far away
+        if (distance > 20f && speed < 0.5f)
+            AddReward(-0.01f);
+    }
+
+    private void RewardNpcProximity(RayDetail.HitGameObject hitObject, float distance)
+    {
+        float safeDistance = 10f;
+
+        if (hitObject == RayDetail.HitGameObject.Human || hitObject == RayDetail.HitGameObject.Car)
+        {
+            if (distance >= safeDistance)
+            {
+                AddReward(0.002f); // safe gap maintained
+            }
+            else
+            {
+                float penalty = Mathf.Clamp01((safeDistance - distance) / safeDistance);
+                AddReward(-0.005f * penalty);
+            }
+        }
+    }
+
+    private void RewardTrafficLight(float speed, TrafficLight trafficLight, float distance)
+    {
+        switch (trafficLight)
+        {
+            case TrafficLight.Red:
+                if (distance < 30f)
+                {
+                    // Smooth target speed: ~10 m/s at 30m → 0 m/s at 8m
+                    float targetRedSpeed = Mathf.Lerp(0f, 10f, Mathf.Clamp01((distance - 8f) / 22f));
+                    float err = speed - targetRedSpeed;
+
+                    if (err > 0f)
+                    {
+                        // Too fast for current distance
+                        AddReward(-0.02f * Mathf.Clamp(err / 10f, 0f, 1f));
+                    }
+                    else if (distance < 10f && speed < 0.5f)
+                    {
+                        // Correctly stopped at red
+                        AddReward(0.005f);
+                    }
+                    // No reward for just being under speed — avoids exploitation
+                }
+                break;
+
+            case TrafficLight.Yellow:
+                if (distance < 20f)
+                {
+                    // Should be slowing
+                    float targetYellowSpeed = Mathf.Lerp(0f, 8f, Mathf.Clamp01((distance - 5f) / 15f));
+                    float err = speed - targetYellowSpeed;
+                    if (err > 0f)
+                        AddReward(-0.01f * Mathf.Clamp(err / 8f, 0f, 1f));
+                    else
+                        AddReward(0.001f);
+                }
+                break;
+
+            case TrafficLight.Green:
+                if (speed < 1f)
+                    AddReward(-0.005f); // shouldn't be stopped on green
+                else if (speed >= 2f && speed <= MAX_SPEED)
+                    AddReward(0.002f);
+                break;
+
+            default:
+                // No light detected — penalise idling only if nothing is blocking
+                if (speed < 0.1f)
+                    AddReward(-0.002f);
+                break;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // COLLISIONS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void OnCollisionEnter(Collision collision)
+    {
+        switch (collision.gameObject.tag)
+        {
+            case "sideway":
+                AddReward(-1.0f);
+                EndEpisode();
+                break;
+
+            case "HumanNPC":
+                AddReward(-8.0f);
+                EndEpisode();
+                break;
+
+            case "CarNPC":
+                AddReward(-7.0f);
+                EndEpisode();
+                break;
+
+            case "Obstacle":
+                // Heavy penalty — must outweigh any "escape via reset" benefit
+                AddReward(-5.0f);
+                EndEpisode();
+                break;
+
+            case "Goal":
+                AddReward(2.0f);
+                EndEpisode();
+                break;
+        }
+    }
+
+    private void OnTriggerEnter(Collider other) { }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // RED LIGHT VIOLATION CALLBACK
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void OnRedLightViolation()
+    {
+        redLightViolated = true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // VEHICLE CONTROL
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void HandleMotor(float acceleration, float brake)
+    {
+        frontLeftWheelCollider.motorTorque = acceleration * motorForce;
+        frontRightWheelCollider.motorTorque = acceleration * motorForce;
+        ApplyBraking(brake > 0f ? breakForce * brake : 0f);
+    }
+
+    private void ApplyBraking(float brakeForce)
+    {
+        frontRightWheelCollider.brakeTorque = brakeForce;
+        frontLeftWheelCollider.brakeTorque = brakeForce;
+        rearLeftWheelCollider.brakeTorque = brakeForce;
+        rearRightWheelCollider.brakeTorque = brakeForce;
+    }
+
+    private void HandleSteering(float steerInput)
+    {
+        currentSteerAngle = maxSteerAngle * steerInput;
+        frontLeftWheelCollider.steerAngle = currentSteerAngle;
+        frontRightWheelCollider.steerAngle = currentSteerAngle;
+    }
+
+    private void UpdateWheels()
+    {
+        UpdateSingleWheel(frontLeftWheelCollider, frontLeftWheelTransform);
+        UpdateSingleWheel(frontRightWheelCollider, frontRightWheelTransform);
+        UpdateSingleWheel(rearRightWheelCollider, rearRightWheelTransform);
+        UpdateSingleWheel(rearLeftWheelCollider, rearLeftWheelTransform);
+    }
+
+    private void UpdateSingleWheel(WheelCollider col, Transform t)
+    {
+        col.GetWorldPose(out Vector3 pos, out Quaternion rot);
+        t.position = pos;
+        t.rotation = rot;
+    }
+
+    private void ResetWheelTorques()
+    {
+        foreach (var wc in new[] { frontLeftWheelCollider, frontRightWheelCollider,
+                                   rearLeftWheelCollider,  rearRightWheelCollider })
+        {
+            wc.motorTorque = 0f;
+            wc.brakeTorque = 0f;
+            wc.steerAngle = 0f;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // HEURISTIC (manual control for testing)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    public override void Heuristic(in ActionBuffers actionsOut)
+    {
+        var c = actionsOut.ContinuousActions;
+        c[0] = Input.GetAxis("Horizontal");
+        c[1] = Input.GetAxis("Vertical");
+        c[2] = Input.GetKey(KeyCode.Space) ? 1.0f : 0.0f;
+    }
+}
+
+
+
+
+
+
+
+
+
+using UnityEngine;
+using Unity.MLAgents;
+using Unity.MLAgents.Sensors;
+using Unity.MLAgents.Actuators;
+using System.Collections.Generic;
+
+public class CarAgent : Agent
+{
+    private Rigidbody rb;
+    private RayPerceptionSensorComponent3D raySensor;
+    private RayDetail rayDetail;
+
+    [SerializeField] private WheelCollider frontLeftWheelCollider, frontRightWheelCollider;
+    [SerializeField] private WheelCollider rearLeftWheelCollider, rearRightWheelCollider;
+
+    [SerializeField] private Transform frontLeftWheelTransform, frontRightWheelTransform;
+    [SerializeField] private Transform rearLeftWheelTransform, rearRightWheelTransform;
+
+    [SerializeField] private float motorForce = 1500f;
+    [SerializeField] private float maxSteerAngle = 30f;
+    [SerializeField] private float brakeForce = 4000f;
+
+    [SerializeField] private TestPath pathProvider;
+    private List<Waypoint> path;
+    private int currentWaypointIndex = 0;
+    private float previousDistanceToWaypoint = 0f;
+    private bool redLightViolated = false;
+
+    private Vector3 startPosition;
+    private Quaternion startRotation;
+    private float currentSteerAngle;
+    private float previousSteerAngle;
+    private float previousSpeed;
+
+    // ── Tuneable constants (centralised for easy tweaking) ─────────────────
+    private const float SLOW_DISTANCE = 20f;  // was undefined — now explicit
+    private const float STOP_DISTANCE = 7f;
+    private const float DRIFT_DISTANCE = 35f;
+    private const float SAFE_NPC_DIST = 10f;
+    private const float MAX_SPEED = 18f;
+    private const float WAYPOINT_REACH = 6f;
+    private const float WAYPOINT_ABORT = 36f;
+
+    public override void Initialize()
+    {
+        rb = GetComponent<Rigidbody>();
+        startPosition = transform.localPosition;
+        startRotation = transform.localRotation;
+        raySensor = GetComponent<RayPerceptionSensorComponent3D>();
+        rayDetail = GetComponent<RayDetail>();
+    }
+
+    public override void OnEpisodeBegin()
+    {
+        rb.velocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+
+        previousSpeed = 0f;
+        previousSteerAngle = 0f;
+        currentSteerAngle = 0f;
+
+        SelectPath();
+
+        rayDetail.ResetState();
+        redLightViolated = false;
+    }
+
+    private void SelectPath()
+    {
+        if (pathProvider != null)
+        {
+            pathProvider.GetFixedPath();
+            path = pathProvider.CurrentPath;
+            currentWaypointIndex = 0;
+        }
+
+        if (path != null && path.Count > 1)
+        {
+            Vector3 startPos = path[0].transform.position;
+            Vector3 nextPos = path[1].transform.position;
+            Vector3 direction = (nextPos - startPos).normalized;
+
+            transform.position = startPos;
+            transform.rotation = Quaternion.LookRotation(direction, Vector3.up);
+        }
+        else
+        {
+            transform.localPosition = startPosition;
+            transform.localRotation = startRotation;
+        }
+
+        previousDistanceToWaypoint = (path != null && path.Count > 0)
+            ? Vector3.Distance(transform.position, path[0].transform.position)
+            : 0f;
+    }
+
+    public override void CollectObservations(VectorSensor sensor)
+    {
+        float speed = Vector3.Dot(rb.velocity, transform.forward);
+        sensor.AddObservation(Mathf.Clamp(speed / 20f, -1f, 1f));
+
+        sensor.AddObservation(currentSteerAngle / maxSteerAngle);
+
+        float center = LaneDetail.LaneCenter(raySensor);
+        sensor.AddObservation(center);
+
+        var (gameObject, distance, trafficLight) = rayDetail.GetRayInfo();
+        sensor.AddObservation(gameObject == RayDetail.HitGameObject.None ? 1 : 0);
+        sensor.AddObservation(gameObject == RayDetail.HitGameObject.TrafficLight ? 1 : 0);
+        sensor.AddObservation(gameObject == RayDetail.HitGameObject.Human ? 1 : 0);
+        sensor.AddObservation(gameObject == RayDetail.HitGameObject.Car ? 1 : 0);
+
+        sensor.AddObservation(distance);
+
+        sensor.AddObservation(trafficLight == TrafficLight.None ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Red ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Yellow ? 1 : 0);
+        sensor.AddObservation(trafficLight == TrafficLight.Green ? 1 : 0);
+
+        if (path != null && currentWaypointIndex < path.Count)
+        {
+            Vector3 localTarget = transform.InverseTransformPoint(path[currentWaypointIndex].transform.position);
+            sensor.AddObservation(Mathf.Clamp(localTarget.x / 20f, -1f, 1f));
+            sensor.AddObservation(Mathf.Clamp(localTarget.z / 20f, -1f, 1f));
+        }
+        else
+        {
+            sensor.AddObservation(0f);
+            sensor.AddObservation(0f);
+        }
+    }
+
+    public override void OnActionReceived(ActionBuffers actions)
+    {
+        float steerInput = actions.ContinuousActions[0];
+        float accelerationInput = actions.ContinuousActions[1];
+        float brakeInput = actions.ContinuousActions[2];
+
+        HandleMotor(accelerationInput, brakeInput);
+        HandleSteering(steerInput);
+        UpdateWheels();
+
+        float speed = Vector3.Dot(rb.velocity, transform.forward);
+        float laneCenter = LaneDetail.LaneCenter(raySensor);
+        var (hitObject, dist, trafficLight) = rayDetail.GetRayInfo();
+        float distance = dist * 40f;
+
+        bool cautionZone = hitObject != RayDetail.HitGameObject.None && distance < 24f;
+
+        // ── Survival reward (tiny, keeps agent alive and moving) ──────────────
+        // Budget: ~+0.005 / step → small enough not to override task rewards
+        AddReward(0.005f);
+
+        // ── Flip check ───────────────────────────────────────────────────────
+        // Penalty: -1.0 terminal — proportionate; flipping is a hard failure
+        if (transform.up.y < 0.5f)
+        {
+            AddReward(-1.0f);
+            EndEpisode();
+            return;
+        }
+
+        // ── Red-light violation (hard terminal) ──────────────────────────────
+        // Reduced from -3.0 → -2.0: severe but consistent with other terminals
+        if (redLightViolated)
+        {
+            redLightViolated = false;
+            AddReward(-2.0f);
+            EndEpisode();
+            return;
+        }
+
+        // ── Waypoint navigation ──────────────────────────────────────────────
+        if (path != null && currentWaypointIndex < path.Count)
+        {
+            Vector3 target = path[currentWaypointIndex].transform.position;
+            float distanceToWaypoint = Vector3.Distance(transform.position, target);
+
+            // Abort if agent wanders too far from the waypoint
+            if (distanceToWaypoint > WAYPOINT_ABORT)
+            {
+                AddReward(-1.0f);
+                EndEpisode();
+                return;
+            }
+
+            // Progress reward: reward closing the gap, suppress in caution zone
+            if (!cautionZone)
+            {
+                float delta = previousDistanceToWaypoint - distanceToWaypoint;
+                // Scaled down from 0.24 → 0.15 to balance against per-step rewards
+                AddReward(0.15f * delta);
+            }
+
+            // Heading alignment: gentle per-step nudge toward waypoint direction
+            // Kept small (-0.02 max) — heading is already guided by progress reward
+            Vector3 toTarget = (target - transform.position).normalized;
+            float angle = Vector3.Angle(transform.forward, toTarget);
+            AddReward(-0.02f * (angle / 180f));
+
+            // Speed control for sharp approaching turns
+            if (angle > 30f && distanceToWaypoint < 10f)
+            {
+                float t = Mathf.Clamp01((angle - 30f) / 60f);
+                float expectedSpeed = Mathf.Lerp(5f, 1f, t);
+                if (speed > expectedSpeed)
+                    // Reduced from -0.05 → -0.03; already penalised by braking section
+                    AddReward(-0.03f * (speed - expectedSpeed));
+            }
+
+            // Lane-centering during navigation (consistent with standalone lane reward)
+            AddReward(-0.03f * Mathf.Abs(laneCenter));
+
+            // Waypoint reached
+            if (distanceToWaypoint < WAYPOINT_REACH)
+            {
+                // Reduced from 0.3 → 0.2: still meaningful, not inflated
+                AddReward(0.2f);
+                currentWaypointIndex++;
+
+                if (currentWaypointIndex >= path.Count)
+                {
+                    // Path complete — kept at 5.0 as the primary goal signal
+                    AddReward(5.0f);
+                    EndEpisode();
+                    return;
+                }
+            }
+
+            previousDistanceToWaypoint = distanceToWaypoint;
+        }
+
+        // ── Speed rewards ────────────────────────────────────────────────────
+        if (!cautionZone)
+        {
+            // Proportional speed reward: max +0.02 at full speed
+            AddReward(Mathf.Clamp(speed / 20f, 0f, 1f) * 0.02f);
+            // Bonus for meaningful motion (unchanged)
+            if (speed > 2f)
+                AddReward(0.001f);
+        }
+
+        // Speeding penalty above MAX_SPEED
+        if (speed > MAX_SPEED)
+            AddReward(-0.004f * (speed - MAX_SPEED));
+
+        // ── Steering smoothness ──────────────────────────────────────────────
+        float steerChange = Mathf.Abs(currentSteerAngle - previousSteerAngle);
+        previousSteerAngle = currentSteerAngle;
+        // Weight jerkiness more when already off-centre (original logic preserved)
+        float steerPenalty = steerChange / maxSteerAngle * (1f - Mathf.Exp(-5f * Mathf.Abs(laneCenter)));
+        AddReward(-0.004f * steerPenalty);
+
+        // ── Lane centering (Gaussian peak at centre) ─────────────────────────
+        // Unchanged — max +0.008 / step is well-scaled
+        AddReward(0.008f * Mathf.Exp(-10f * laneCenter * laneCenter));
+ 
+        // ── Obstacle / traffic braking ───────────────────────────────────────
+        if (hitObject != RayDetail.HitGameObject.None && trafficLight != TrafficLight.Green)
+        {
+            float t = Mathf.InverseLerp(STOP_DISTANCE, DRIFT_DISTANCE, distance);
+            float expectedSpeed = Mathf.Lerp(0f, 16f, t);
+            float speedError = speed - expectedSpeed;
+
+            if (speedError > 0f)
+                // Too fast for proximity — scaled down from -0.25 → -0.15
+                AddReward(-0.15f * Mathf.Clamp(speedError / 10f, 0f, 1f));
+            else
+                AddReward(0.05f * Mathf.Exp(-Mathf.Abs(speedError)));
+
+            // Inside hard-stop zone
+            if (distance < STOP_DISTANCE)
+            {
+                // Still moving when should be stopped: penalise
+                // Stopped correctly: reward
+                // Reduced magnitudes from ±0.3/0.2 → ±0.15/0.10 (per-step, accumulates fast)
+                AddReward(speed > 0.3f ? -0.15f : 0.10f);
+            }
+
+            // Smooth deceleration reward (now uses SLOW_DISTANCE constant)
+            float deceleration = previousSpeed - speed;
+            if (deceleration > 0f && deceleration < 2f && speed > 1f && distance < SLOW_DISTANCE)
+            {
+                float urgency = 1f - t;
+                AddReward(0.02f * urgency);
+            }
+
+            // Harsh braking penalty (unchanged — well-scaled)
+            if (deceleration > 2f)
+                AddReward(-0.05f * Mathf.Clamp((deceleration - 2f) / 3f, 0f, 1f));
+
+            // Don't idle far from obstacle
+            if (distance > 16f)
+            {
+                if (speed < 1f)
+                    AddReward(-0.10f);  // Reduced from -0.15; idling isn't catastrophic
+                else if (speed > 3f)
+                    AddReward(0.03f);
+            }
+        }
+        previousSpeed = speed;
+
+        // ── NPC proximity ────────────────────────────────────────────────────
+        if (hitObject == RayDetail.HitGameObject.Human || hitObject == RayDetail.HitGameObject.Car)
+        {
+            if (distance >= SAFE_NPC_DIST)
+                // Reduced from 0.06 → 0.03: good behaviour but not inflated
+                AddReward(0.03f);
+            else
+            {
+                float penalty = Mathf.Clamp(SAFE_NPC_DIST - distance, 0f, SAFE_NPC_DIST) / SAFE_NPC_DIST;
+                AddReward(-0.05f * penalty);
+            }
+        }
+
+        // ── Traffic light behaviour ──────────────────────────────────────────
+        switch (trafficLight)
+        {
+            case TrafficLight.Red:
+                // Moving through a close red light: strong per-step penalty
+                // Reduced from -0.28 → -0.20 (terminal violation already covers worst case)
+                if (distance < 8f && speed > 1f)
+                    AddReward(-0.20f);
+
+                // Waiting at red light at a safe distance: small reward
+                if (distance > 8f && speed < 0.3f)
+                    AddReward(0.02f);
+                break;
+
+            case TrafficLight.Yellow:
+                if (distance < 20f)
+                {
+                    if (speed > 6f)
+                        AddReward(-0.08f);  // Slightly reduced from -0.10
+                    else
+                        AddReward(0.05f);   // Slightly reduced from 0.06
+                }
+                break;
+
+            case TrafficLight.Green:
+                // Idling on green: penalise
+                // Moving on green: reward
+                // Reduced from ±0.2/0.08 → ±0.10/0.05 — per-step accumulation is large
+                if (speed < 1f)
+                    AddReward(-0.10f);
+                else
+                    AddReward(0.05f);
+                break;
+
+            default:
+                // No light visible, no obstacle — penalise unnecessary stops
+                if (speed < 0.1f && hitObject == RayDetail.HitGameObject.None)
+                    AddReward(-0.05f);
+                break;
+        }
+    }
+
+    private void OnRedLightViolation()
+    {
+        redLightViolated = true;
+    }
+
+    private void OnCollisionEnter(Collision collision)
+    {
+        if (collision.gameObject.CompareTag("sideway"))
+        {
+            AddReward(-1.0f);
+            EndEpisode();
+        }
+        else if (collision.gameObject.CompareTag("HumanNPC"))
+        {
+            // Kept high — hitting a human is the worst possible outcome
+            AddReward(-8.0f);
+            EndEpisode();
+        }
+        else if (collision.gameObject.CompareTag("CarNPC"))
+        {
+            // Kept high — serious collision
+            AddReward(-7.0f);
+            EndEpisode();
+        }
+        else if (collision.gameObject.CompareTag("Obstacle"))
+        {
+            AddReward(-1.0f);
+            EndEpisode();
+        }
+        else if (collision.gameObject.CompareTag("Goal"))
+        {
+            AddReward(1.0f);
+            EndEpisode();
+        }
+    }
+
+    private void OnTriggerEnter(Collider other) { }
+
+    private void HandleMotor(float acceleration, float brake)
+    {
+        frontLeftWheelCollider.motorTorque = acceleration * motorForce;
+        frontRightWheelCollider.motorTorque = acceleration * motorForce;
+        ApplyBraking(brake > 0f ? brakeForce * brake : 0f);
+    }
+
+    private void ApplyBraking(float brake)
+    {
+        frontRightWheelCollider.brakeTorque = brake;
+        frontLeftWheelCollider.brakeTorque = brake;
+        rearLeftWheelCollider.brakeTorque = brake;
+        rearRightWheelCollider.brakeTorque = brake;
+    }
+
+    private void HandleSteering(float steerInput)
+    {
+        currentSteerAngle = maxSteerAngle * steerInput;
+        frontLeftWheelCollider.steerAngle = currentSteerAngle;
+        frontRightWheelCollider.steerAngle = currentSteerAngle;
+    }
+
+    private void UpdateWheels()
+    {
+        UpdateSingleWheel(frontLeftWheelCollider, frontLeftWheelTransform);
+        UpdateSingleWheel(frontRightWheelCollider, frontRightWheelTransform);
+        UpdateSingleWheel(rearRightWheelCollider, rearRightWheelTransform);
+        UpdateSingleWheel(rearLeftWheelCollider, rearLeftWheelTransform);
+    }
+
+    private void UpdateSingleWheel(WheelCollider wheelCollider, Transform wheelTransform)
+    {
+        Vector3 pos;
+        Quaternion rot;
+        wheelCollider.GetWorldPose(out pos, out rot);
+        wheelTransform.rotation = rot;
+        wheelTransform.position = pos;
+    }
+
+    public override void Heuristic(in ActionBuffers actionsOut)
+    {
+        var continuousActions = actionsOut.ContinuousActions;
+        continuousActions[0] = Input.GetAxis("Horizontal");
+        continuousActions[1] = Input.GetAxis("Vertical");
+        continuousActions[2] = Input.GetKey(KeyCode.Space) ? 1.0f : 0.0f;
+    }
+}

@@ -1,0 +1,292 @@
+using System;
+using System.Net.Sockets;
+using System.Threading;
+using UnityEngine;
+using UnityEngine.Rendering;
+using Newtonsoft.Json;
+
+[RequireComponent(typeof(Camera))]
+public class CameraStreamer : MonoBehaviour
+{
+    [Header("Server")]
+    public string serverIP = "127.0.0.1";
+    public int serverPort = 9999;
+
+    private Camera _cam;
+    private RenderTexture _rt;
+    private int _camWidth;
+    private int _camHeight;
+
+    private TcpClient _client;
+    private NetworkStream _stream;
+    private Thread _sendThread;
+    private Thread _recvThread;
+    private volatile bool _running;
+
+    private byte[] _latestFrame;
+    private bool _frameReady;
+    private readonly object _frameLock = new object();
+    private readonly SemaphoreSlim _frameSem = new SemaphoreSlim(0, 1);
+
+    private readonly byte[] _header = new byte[4];
+    private int _frameBytes;
+
+    // 🔥 latest JSON (shared safely)
+    private string _latestJson = null;
+    private readonly object _jsonLock = new object();
+
+    // ── JSON STRUCT ─────────────────────────────
+    [Serializable]
+    public class Detection
+    {
+        public string cls;
+        public float confidence;
+    }
+
+    [Serializable]
+    public class ResponseData
+    {
+        public float confidence;
+        public Detection[] detections;
+    }
+
+    void Start()
+    {
+        _cam = GetComponent<Camera>();
+
+        _camWidth = _cam.pixelWidth;
+        _camHeight = _cam.pixelHeight;
+
+        _rt = new RenderTexture(_camWidth, _camHeight, 0, RenderTextureFormat.ARGB32);
+        _rt.Create();
+
+        _frameBytes = _camWidth * _camHeight * 3;
+
+        Connect();
+    }
+
+    void FixedUpdate()
+    {
+        if (!_running) return;
+
+        CaptureAsync();
+
+        // 🔥 Use received data (lightweight)
+        HandleLatestResponse();
+    }
+
+    void OnDestroy() => Disconnect();
+
+    // ── CAPTURE ────────────────────────────────
+    private void CaptureAsync()
+    {
+        _cam.targetTexture = _rt;
+        _cam.Render();
+        _cam.targetTexture = null;
+
+        AsyncGPUReadback.Request(_rt, 0, TextureFormat.RGB24, OnReadbackComplete);
+    }
+
+    private void OnReadbackComplete(AsyncGPUReadbackRequest req)
+    {
+        if (req.hasError || !_running) return;
+
+        var data = req.GetData<byte>();
+        byte[] frame = new byte[_frameBytes];
+        data.CopyTo(frame);
+
+        lock (_frameLock)
+        {
+            _latestFrame = frame;
+
+            if (!_frameReady)
+            {
+                _frameReady = true;
+                if (_frameSem.CurrentCount == 0)
+                    _frameSem.Release();
+            }
+        }
+    }
+
+    // ── NETWORK ────────────────────────────────
+    private void Connect()
+    {
+        try
+        {
+            _client = new TcpClient();
+            _client.NoDelay = true;
+            _client.SendBufferSize = _frameBytes * 4;
+
+            _client.Connect(serverIP, serverPort);
+            _stream = _client.GetStream();
+
+            // handshake
+            byte[] handshake = new byte[8];
+            handshake[0] = (byte)(_camWidth >> 24);
+            handshake[1] = (byte)(_camWidth >> 16);
+            handshake[2] = (byte)(_camWidth >> 8);
+            handshake[3] = (byte)(_camWidth);
+
+            handshake[4] = (byte)(_camHeight >> 24);
+            handshake[5] = (byte)(_camHeight >> 16);
+            handshake[6] = (byte)(_camHeight >> 8);
+            handshake[7] = (byte)(_camHeight);
+
+            _stream.Write(handshake, 0, 8);
+
+            _running = true;
+
+            _sendThread = new Thread(SendLoop) { IsBackground = true };
+            _recvThread = new Thread(ReceiveLoop) { IsBackground = true };
+
+            _sendThread.Start();
+            _recvThread.Start();
+
+            Debug.Log($"[Connected] {serverIP}:{serverPort}");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Connection failed: {e.Message}");
+        }
+    }
+
+    private void Disconnect()
+    {
+        _running = false;
+
+        _frameSem.Release();
+
+        _stream?.Close();
+        _client?.Close();
+
+        _sendThread?.Join(500);
+        _recvThread?.Join(500);
+
+        _rt?.Release();
+    }
+
+    // ── SEND THREAD ────────────────────────────
+    private void SendLoop()
+    {
+        while (_running)
+        {
+            _frameSem.Wait();
+            if (!_running) break;
+
+            byte[] frame;
+
+            lock (_frameLock)
+            {
+                frame = _latestFrame;
+                _frameReady = false;
+            }
+
+            if (frame == null) continue;
+
+            try
+            {
+                int len = frame.Length;
+
+                _header[0] = (byte)(len >> 24);
+                _header[1] = (byte)(len >> 16);
+                _header[2] = (byte)(len >> 8);
+                _header[3] = (byte)(len);
+
+                _stream.Write(_header, 0, 4);
+                _stream.Write(frame, 0, len);
+            }
+            catch
+            {
+                _running = false;
+            }
+        }
+    }
+
+    // ── RECEIVE THREAD (ULTRA LIGHT) ───────────
+    private void ReceiveLoop()
+    {
+        try
+        {
+            while (_running)
+            {
+                byte[] header = ReadExact(4);
+                if (header == null) break;
+
+                int length =
+                    (header[0] << 24) |
+                    (header[1] << 16) |
+                    (header[2] << 8) |
+                    header[3];
+
+                byte[] data = ReadExact(length);
+                if (data == null) break;
+
+                string json = System.Text.Encoding.UTF8.GetString(data);
+
+                // 🔥 only store (NO parsing here)
+                lock (_jsonLock)
+                {
+                    _latestJson = json;
+                }
+            }
+        }
+        catch { }
+    }
+
+    // ── USE RESPONSE (MAIN THREAD SAFE) ────────
+    private void HandleLatestResponse()
+    {
+        string json = null;
+
+        lock (_jsonLock)
+        {
+            if (_latestJson == null) return;
+            json = _latestJson;
+            _latestJson = null; // consume once
+        }
+
+        try
+        {
+            var parsed = JsonConvert.DeserializeObject<ResponseData>(json);
+
+            // 🔥 LIMIT LOGGING (no lag)
+            if (Time.frameCount % 30 == 0)
+            {
+                Debug.Log($"Confidence: {parsed.confidence} | Detections: {parsed.detections?.Length}");
+            }
+
+            // 🚗 YOUR CONTROL LOGIC HERE
+            /*
+            if (parsed.confidence < 0.3)
+            {
+                // steer correction
+            }
+
+            foreach (var d in parsed.detections)
+            {
+                if (d.cls == "Pedestrian")
+                {
+                    // brake
+                }
+            }
+            */
+        }
+        catch { }
+    }
+
+    // ── READ EXACT ────────────────────────────
+    private byte[] ReadExact(int size)
+    {
+        byte[] buffer = new byte[size];
+        int total = 0;
+
+        while (total < size)
+        {
+            int read = _stream.Read(buffer, total, size - total);
+            if (read == 0) return null;
+            total += read;
+        }
+
+        return buffer;
+    }
+}

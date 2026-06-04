@@ -1,0 +1,321 @@
+behaviors:
+CarAgent:
+trainer_type: ppo
+
+hyperparameters:
+      batch_size: 2048
+      buffer_size: 20480
+      learning_rate: 5e-4
+      beta: 5e-3
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+
+    network_settings:
+num_layers: 3
+      hidden_units: 512
+
+    reward_signals:
+extrinsic:
+gamma: 0.99
+        strength: 1.0
+
+    max_steps: 5_000_000
+    time_horizon: 128
+    summary_freq: 10000
+
+# ══════════════════════════════════════════════
+# PHASE 1 — Straight Road (Learn basic driving)
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 512
+      buffer_size: 10240
+      learning_rate: 3.0e-4
+      beta: 5.0e-3
+      epsilon: 0.2
+      lambd: 0.90
+      num_epoch: 3
+
+    network_settings:
+      normalize: true
+      hidden_units: 128
+      num_layers: 2
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+
+    max_steps: 1000000
+    time_horizon: 256        # short — straight road episodes resolve quickly
+    summary_freq: 10000
+
+---
+# ══════════════════════════════════════════════
+# PHASE 2 — Curved Road
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 1024
+      buffer_size: 20480
+      learning_rate: 2.5e-4
+      beta: 4.0e-3          # slightly less entropy than phase 1
+      epsilon: 0.2
+      lambd: 0.92
+      num_epoch: 3
+
+    network_settings:
+      normalize: true
+      hidden_units: 128
+      num_layers: 2
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+
+    max_steps: 2000000
+    time_horizon: 512        # longer — curves take more steps to complete
+    summary_freq: 10000
+
+---
+# ══════════════════════════════════════════════
+# PHASE 3 — Waypoint Following + Intersections
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 1024
+      buffer_size: 20480
+      learning_rate: 1.5e-4
+      beta: 2.0e-3           # lower entropy, exploit driving skills
+      epsilon: 0.15          # tighter clipping for stable turning
+      lambd: 0.95
+      num_epoch: 4
+
+    network_settings:
+      normalize: true
+      hidden_units: 256      # bigger network, navigation is complex
+      num_layers: 3
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.995         # think further ahead for multi-waypoint planning
+        strength: 1.0
+
+    max_steps: 5000000       # intersections are hard, needs more steps
+    time_horizon: 512
+    summary_freq: 10000
+
+---
+# ══════════════════════════════════════════════
+# PHASE 4 — Traffic Lights
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 2048
+      buffer_size: 40960
+      learning_rate: 1.0e-4
+      beta: 1.5e-3           # low entropy, precise stop/go behavior
+      epsilon: 0.15
+      lambd: 0.95
+      num_epoch: 4
+
+    network_settings:
+      normalize: true
+      hidden_units: 256
+      num_layers: 3
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.995
+        strength: 1.0
+
+    max_steps: 4000000
+    time_horizon: 512
+    summary_freq: 10000
+
+---
+# ══════════════════════════════════════════════
+# PHASE 5 — Obstacle / NPC Detection
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 2048
+      buffer_size: 40960
+      learning_rate: 8.0e-5
+      beta: 1.0e-3
+      epsilon: 0.1           # very tight, precise avoidance behavior
+      lambd: 0.95
+      num_epoch: 4
+
+    network_settings:
+      normalize: true
+      hidden_units: 256
+      num_layers: 3
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.995
+        strength: 1.0
+
+    max_steps: 5000000
+    time_horizon: 512
+    summary_freq: 10000
+
+---
+# ══════════════════════════════════════════════
+# PHASE 6 — Full Environment
+# ══════════════════════════════════════════════
+behaviors:
+  CarAgent:
+    trainer_type: ppo
+
+    hyperparameters:
+      batch_size: 4096
+      buffer_size: 81920
+      learning_rate: 5.0e-5   # very small, just refining everything
+      beta: 8.0e-4
+      epsilon: 0.1
+      lambd: 0.95
+      num_epoch: 4
+
+    network_settings:
+      normalize: true
+      hidden_units: 256
+      num_layers: 3
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.995
+        strength: 1.0
+
+    max_steps: 10000000       # full complexity needs maximum steps
+    time_horizon: 1024        # longer horizon, complex multi-task decisions
+    summary_freq: 10000
+
+
+
+Phase 3 v2:   8.0e-5
+Phase 4:      6.0e-5
+Phase 5:      4.0e-5
+Phase 6:      2.0e-5
+
+
+
+
+
+using UnityEngine;
+using UnityEngine.AI;
+using HealthbarGames;
+
+public class NPCPedestrianController : MonoBehaviour
+{
+    public NavMeshAgent agent;
+    public Animator animator;
+
+    public GameObject PATH;
+    private SphereWaypoint[] waypoints;
+
+    public float minDistance = 0.5f;
+    private int index = 0;
+
+    private bool waitingAtCrossing = false;
+
+    void Start()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        animator = GetComponent<Animator>();
+
+        agent.updateRotation = true;  // Smooth rotation
+
+        // Load waypoints
+        int count = PATH.transform.childCount;
+        waypoints = new SphereWaypoint[count];
+        for (int i = 0; i < count; i++)
+        {
+            waypoints[i] = PATH.transform.GetChild(i)
+                .GetComponent<SphereWaypoint>();
+        }
+
+        if (waypoints.Length > 0)
+            agent.SetDestination(waypoints[index].transform.position);
+    }
+
+    void Update()
+    {
+        Move();
+        HandleAnimation();
+    }
+
+    void Move()
+    {
+        if (waypoints.Length == 0) return;
+
+        var currentWP = waypoints[index];
+
+        // Stop at crossing start if light not red
+        if (currentWP.isCrossingStart)
+        {
+            float distanceToWP = Vector3.Distance(transform.position, currentWP.transform.position);
+
+            if (!CanCross(currentWP))
+            {
+                if (distanceToWP < 1f)
+                {
+                    agent.isStopped = true;
+                    waitingAtCrossing = true;
+                    return;
+                }
+
+            }
+            else if (waitingAtCrossing)
+            {
+                // Light turned red, resume
+                agent.isStopped = false;
+                waitingAtCrossing = false;
+            }
+        }
+
+        // Check if we reached the waypoint
+        if (!agent.pathPending && agent.remainingDistance < minDistance)
+        {
+            index++;
+            if (index >= waypoints.Length)
+                index = 0;
+
+            agent.SetDestination(waypoints[index].transform.position);
+        }
+    }
+
+    bool CanCross(SphereWaypoint wp)
+    {
+        if (wp.trafficLight == null) return true;
+
+        // Pedestrian crosses only if car light is RED (Stop)
+        // return wp.trafficLight.GetState() ==
+        //        TrafficLightBase.State.Stop;
+        return true;
+    }
+
+    void HandleAnimation()
+    {
+        if (animator != null)
+            animator.SetFloat("Speed", agent.velocity.magnitude);
+    }
+}

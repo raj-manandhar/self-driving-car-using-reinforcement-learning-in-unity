@@ -1,0 +1,409 @@
+
+float speed = Vector3.Dot(rb.velocity, transform.forward);
+float laneCenter = LaneDetail.LaneCenter(raySensor);
+var (hitObject, dist, trafficLight) = rayDetail.GetRayInfo();
+float distance = dist * 40f;
+
+bool cautionZone = hitObject != RayDetail.HitGameObject.None && distance < 24f;
+
+// ── Survival Reward ───────────────────────────────────────────────────
+AddReward(0.0005f);
+
+// ── FLIP CHECK ─────────────────────────────────────────────
+if (transform.up.y < 0.5f)
+{
+    AddReward(-1.0f);
+    EndEpisode();
+    return;
+}
+
+// ── Red Light Violation ─────────────────────────────────────────────
+if (redLightViolated)
+{
+    redLightViolated = false;
+    AddReward(-3.0f);
+    EndEpisode();
+    return;
+}
+
+// ── WAYPOINT NAVIGATION ────────────────────────────────────
+if (path != null && currentWaypointIndex < path.Count)
+{
+    Vector3 target = path[currentWaypointIndex].transform.position;
+    float distanceToWaypoint = Vector3.Distance(transform.position, target);
+
+    if (distanceToWaypoint > 36f)
+    {
+        AddReward(-1.0f);
+        EndEpisode();
+        return;
+    }
+
+    // Progress reward
+    if (!cautionZone)
+    {
+        float delta = previousDistanceToWaypoint - distanceToWaypoint;
+        AddReward(0.24f * delta);
+    }
+
+    // Heading aligngment
+    Vector3 toTarget = (target - transform.position).normalized;
+    float angle = Vector3.Angle(transform.forward, toTarget);
+    float expectedAngle = Mathf.Atan2(2.6f, distanceToWaypoint) * Mathf.Rad2Deg;
+    float angleError = angle - expectedAngle;
+    AddReward(-0.04f * (angle / 180f));
+
+    // Speed control for sharp turns
+    if (angle > 30f && distanceToWaypoint < 10f)
+    {
+        float t = Mathf.Clamp01((angle - 30f) / 60f);
+        float expectedSpeed = Mathf.Lerp(5f, 1f, t);
+        if (speed > expectedSpeed)
+            AddReward(-0.05f * (speed - expectedSpeed));
+    }
+
+    AddReward(-0.05f * Mathf.Abs(laneCenter));
+
+    if (distanceToWaypoint < 6f)
+    {
+        AddReward(0.3f);
+        currentWaypointIndex++;
+
+        if (currentWaypointIndex >= path.Count)
+        {
+            AddReward(5.0f);
+            EndEpisode();
+            return;
+        }
+    }
+
+    previousDistanceToWaypoint = distanceToWaypoint;
+}
+
+// ── SPEED REWARDS ──────────────────────────────────────────
+if (!cautionZone)
+{
+    AddReward(Mathf.Clamp(speed / 20f, 0f, 1f) * 0.02f);
+    if (speed > 2f)
+        AddReward(0.001f);
+}
+
+if (speed > 18f)
+    AddReward(-0.004f * (speed - 18f));
+
+// ── STEERING SMOOTHNESS ────────────────────────────────────
+float steerChange = Mathf.Abs(currentSteerAngle - previousSteerAngle);
+previousSteerAngle = currentSteerAngle;
+float steerPenalty = steerChange / maxSteerAngle * (1f - Mathf.Exp(-5f * Mathf.Abs(laneCenter)));
+AddReward(-0.004f * steerPenalty);
+
+// ── LANE CENTERING ─────────────────────────────────────────
+AddReward(0.008f * Mathf.Exp(-10f * laneCenter * laneCenter));
+
+// ── OBSTACLE BRAKING ────────────────────────────────────────
+if (hitObject != RayDetail.HitGameObject.None && trafficLight != TrafficLight.Green)
+{
+    float stopDistance = 7f;
+    float driftDistance = 35f;
+
+    float t = Mathf.InverseLerp(stopDistance, driftDistance, distance);
+    float expectedSpeed = Mathf.Lerp(0f, 16f, t);
+    float speedError = speed - expectedSpeed;
+
+    if (speedError > 0f)
+        AddReward(-0.25f * Mathf.Clamp(speedError / 10f, 0f, 1f));
+    else
+        AddReward(0.05f * Mathf.Exp(-Mathf.Abs(speedError)));
+
+    if (distance < stopDistance)
+    {
+        AddReward(speed > 0.3f ? -0.3f : 0.2f);
+    }
+
+    float deceleration = previousSpeed - speed;
+    if (deceleration > 0f && deceleration < 2f && speed > 1f && distance < slowDistance)
+    {
+        float urgency = 1f - t;
+        AddReward(0.02f * urgency);
+    }
+
+    if (deceleration > 2f)
+        AddReward(-0.05f * Mathf.Clamp((deceleration - 2f) / 3f, 0f, 1f));
+
+    if (distance > 16f)
+    {
+        if (speed < 1f)
+            AddReward(-0.15f);
+        else if (speed > 3f)
+            AddReward(0.03f);
+    }
+}
+previousSpeed = speed;
+
+// ── NPC DETECTION ──────────────────────────────────────────
+float safeDistance = 10f;
+
+if (hitObject == RayDetail.HitGameObject.Human || hitObject == RayDetail.HitGameObject.Car)
+{
+    if (distance >= safeDistance)
+        AddReward(0.06f);
+    else
+    {
+        float penalty = Mathf.Clamp(safeDistance - distance, 0, safeDistance) / safeDistance;
+        AddReward(-0.05f * penalty);
+    }
+}
+
+// ── TRAFFIC LIGHT ──────────────────────────────────────────
+switch (trafficLight)
+{
+    case TrafficLight.Red:
+        if (distance < 8f && speed > 1f)
+        {
+            AddReward(-0.28f);
+        }
+
+        if (distance > 8f && speed < 0.3f)
+        {
+            AddReward(0.02f);
+        }
+        break;
+
+    case TrafficLight.Yellow:
+        if (distance < 20f)
+        {
+            if (speed > 6f)
+                AddReward(-0.1f);
+            else
+                AddReward(0.06f);
+        }
+        break;
+
+    case TrafficLight.Green:
+        if (speed < 1f)
+            AddReward(-0.2f);
+        else
+            AddReward(0.08f);
+        break;
+
+    default:
+        if (speed < 0.1f && hitObject == RayDetail.HitGameObject.None)
+            AddReward(-0.05f);
+        break;
+}
+
+
+
+
+
+
+// new reward magnitued 
+
+bool cautionZone = hitObject != RayDetail.HitGameObject.None && distance < 24f;
+
+// ── Survival reward (tiny, keeps agent alive and moving) ──────────────
+// Budget: ~+0.005 / step → small enough not to override task rewards
+AddReward(0.005f);
+
+// ── Flip check ───────────────────────────────────────────────────────
+// Penalty: -1.0 terminal — proportionate; flipping is a hard failure
+if (transform.up.y < 0.5f)
+{
+    AddReward(-1.0f);
+    EndEpisode();
+    return;
+}
+
+// ── Red-light violation (hard terminal) ──────────────────────────────
+// Reduced from -3.0 → -2.0: severe but consistent with other terminals
+if (redLightViolated)
+{
+    redLightViolated = false;
+    AddReward(-2.0f);
+    EndEpisode();
+    return;
+}
+
+// ── Waypoint navigation ──────────────────────────────────────────────
+if (path != null && currentWaypointIndex < path.Count)
+{
+    Vector3 target = path[currentWaypointIndex].transform.position;
+    float distanceToWaypoint = Vector3.Distance(transform.position, target);
+
+    // Abort if agent wanders too far from the waypoint
+    if (distanceToWaypoint > WAYPOINT_ABORT)
+    {
+        AddReward(-1.0f);
+        EndEpisode();
+        return;
+    }
+
+    // Progress reward: reward closing the gap, suppress in caution zone
+    if (!cautionZone)
+    {
+        float delta = previousDistanceToWaypoint - distanceToWaypoint;
+        // Scaled down from 0.24 → 0.15 to balance against per-step rewards
+        AddReward(0.15f * delta);
+    }
+
+    // Heading alignment: gentle per-step nudge toward waypoint direction
+    // Kept small (-0.02 max) — heading is already guided by progress reward
+    Vector3 toTarget = (target - transform.position).normalized;
+    float angle = Vector3.Angle(transform.forward, toTarget);
+    AddReward(-0.02f * (angle / 180f));
+
+    // Speed control for sharp approaching turns
+    if (angle > 30f && distanceToWaypoint < 10f)
+    {
+        float t = Mathf.Clamp01((angle - 30f) / 60f);
+        float expectedSpeed = Mathf.Lerp(5f, 1f, t);
+        if (speed > expectedSpeed)
+            // Reduced from -0.05 → -0.03; already penalised by braking section
+            AddReward(-0.03f * (speed - expectedSpeed));
+    }
+
+    // Lane-centering during navigation (consistent with standalone lane reward)
+    AddReward(-0.03f * Mathf.Abs(laneCenter));
+
+    // Waypoint reached
+    if (distanceToWaypoint < WAYPOINT_REACH)
+    {
+        // Reduced from 0.3 → 0.2: still meaningful, not inflated
+        AddReward(0.2f);
+        currentWaypointIndex++;
+
+        if (currentWaypointIndex >= path.Count)
+        {
+            // Path complete — kept at 5.0 as the primary goal signal
+            AddReward(5.0f);
+            EndEpisode();
+            return;
+        }
+    }
+
+    previousDistanceToWaypoint = distanceToWaypoint;
+}
+
+// ── Speed rewards ────────────────────────────────────────────────────
+if (!cautionZone)
+{
+    // Proportional speed reward: max +0.02 at full speed
+    AddReward(Mathf.Clamp(speed / 20f, 0f, 1f) * 0.02f);
+    // Bonus for meaningful motion (unchanged)
+    if (speed > 2f)
+        AddReward(0.001f);
+}
+
+// Speeding penalty above MAX_SPEED
+if (speed > MAX_SPEED)
+    AddReward(-0.004f * (speed - MAX_SPEED));
+
+// ── Steering smoothness ──────────────────────────────────────────────
+float steerChange = Mathf.Abs(currentSteerAngle - previousSteerAngle);
+previousSteerAngle = currentSteerAngle;
+// Weight jerkiness more when already off-centre (original logic preserved)
+float steerPenalty = steerChange / maxSteerAngle * (1f - Mathf.Exp(-5f * Mathf.Abs(laneCenter)));
+AddReward(-0.004f * steerPenalty);
+
+// ── Lane centering (Gaussian peak at centre) ─────────────────────────
+// Unchanged — max +0.008 / step is well-scaled
+AddReward(0.008f * Mathf.Exp(-10f * laneCenter * laneCenter));
+
+// ── Obstacle / traffic braking ───────────────────────────────────────
+if (hitObject != RayDetail.HitGameObject.None && trafficLight != TrafficLight.Green)
+{
+    float t = Mathf.InverseLerp(STOP_DISTANCE, DRIFT_DISTANCE, distance);
+    float expectedSpeed = Mathf.Lerp(0f, 16f, t);
+    float speedError = speed - expectedSpeed;
+
+    if (speedError > 0f)
+        // Too fast for proximity — scaled down from -0.25 → -0.15
+        AddReward(-0.15f * Mathf.Clamp(speedError / 10f, 0f, 1f));
+    else
+        AddReward(0.05f * Mathf.Exp(-Mathf.Abs(speedError)));
+
+    // Inside hard-stop zone
+    if (distance < STOP_DISTANCE)
+    {
+        // Still moving when should be stopped: penalise
+        // Stopped correctly: reward
+        // Reduced magnitudes from ±0.3/0.2 → ±0.15/0.10 (per-step, accumulates fast)
+        AddReward(speed > 0.3f ? -0.15f : 0.10f);
+    }
+
+    // Smooth deceleration reward (now uses SLOW_DISTANCE constant)
+    float deceleration = previousSpeed - speed;
+    if (deceleration > 0f && deceleration < 2f && speed > 1f && distance < SLOW_DISTANCE)
+    {
+        float urgency = 1f - t;
+        AddReward(0.02f * urgency);
+    }
+
+    // Harsh braking penalty (unchanged — well-scaled)
+    if (deceleration > 2f)
+        AddReward(-0.05f * Mathf.Clamp((deceleration - 2f) / 3f, 0f, 1f));
+
+    // Don't idle far from obstacle
+    if (distance > 16f)
+    {
+        if (speed < 1f)
+            AddReward(-0.10f);  // Reduced from -0.15; idling isn't catastrophic
+        else if (speed > 3f)
+            AddReward(0.03f);
+    }
+}
+previousSpeed = speed;
+
+// ── NPC proximity ────────────────────────────────────────────────────
+if (hitObject == RayDetail.HitGameObject.Human || hitObject == RayDetail.HitGameObject.Car)
+{
+    if (distance >= SAFE_NPC_DIST)
+        // Reduced from 0.06 → 0.03: good behaviour but not inflated
+        AddReward(0.03f);
+    else
+    {
+        float penalty = Mathf.Clamp(SAFE_NPC_DIST - distance, 0f, SAFE_NPC_DIST) / SAFE_NPC_DIST;
+        AddReward(-0.05f * penalty);
+    }
+}
+
+// ── Traffic light behaviour ──────────────────────────────────────────
+switch (trafficLight)
+{
+    case TrafficLight.Red:
+        // Moving through a close red light: strong per-step penalty
+        // Reduced from -0.28 → -0.20 (terminal violation already covers worst case)
+        if (distance < 8f && speed > 1f)
+            AddReward(-0.20f);
+
+        // Waiting at red light at a safe distance: small reward
+        if (distance > 8f && speed < 0.3f)
+            AddReward(0.02f);
+        break;
+
+    case TrafficLight.Yellow:
+        if (distance < 20f)
+        {
+            if (speed > 6f)
+                AddReward(-0.08f);  // Slightly reduced from -0.10
+            else
+                AddReward(0.05f);   // Slightly reduced from 0.06
+        }
+        break;
+
+    case TrafficLight.Green:
+        // Idling on green: penalise
+        // Moving on green: reward
+        // Reduced from ±0.2/0.08 → ±0.10/0.05 — per-step accumulation is large
+        if (speed < 1f)
+            AddReward(-0.10f);
+        else
+            AddReward(0.05f);
+        break;
+
+    default:
+        // No light visible, no obstacle — penalise unnecessary stops
+        if (speed < 0.1f && hitObject == RayDetail.HitGameObject.None)
+            AddReward(-0.05f);
+        break;
+}

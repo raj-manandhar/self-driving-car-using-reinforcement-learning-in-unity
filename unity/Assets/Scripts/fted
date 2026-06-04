@@ -1,0 +1,132 @@
+using UnityEngine;
+using System.Collections.Generic;
+
+/// <summary>
+/// TestPath — extended with minimap integration.
+///
+/// New members added vs. original:
+///   • HasManualPath  — true while minimap has pushed a path
+///   • SetPath()      — called by MinimapController to override random generation
+///   • ClearManualPath() — reverts to random mode (e.g. on training reset)
+///
+/// Existing behaviour is unchanged when HasManualPath is false.
+/// </summary>
+public class TestPath : MonoBehaviour
+{
+    public Transform waypointParent;   // assign in inspector
+    public List<Waypoint> allWaypoints;
+
+    private List<Waypoint> path;
+    public List<Waypoint> CurrentPath => path;
+
+    [Header("Fixed Path Settings")]
+    public Waypoint fixedStart;
+    public Waypoint fixedGoal;
+
+    public Waypoint CurrentStart { get; private set; }
+    public Waypoint CurrentGoal { get; private set; }
+
+    // ── Minimap integration ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// True while the minimap has set a manual path.
+    /// CarAgent.SelectPath() / GenerateRandomPath() respect this flag.
+    /// </summary>
+    public bool HasManualPath { get; private set; }
+
+    /// <summary>
+    /// Called by MinimapController when the user picks a route.
+    /// Sets the path and enables manual-path mode so GenerateRandomPath() is skipped.
+    /// </summary>
+    public void SetPath(List<Waypoint> newPath, Waypoint start, Waypoint goal)
+    {
+        path = newPath;
+        CurrentStart = start;
+        CurrentGoal = goal;
+        HasManualPath = newPath != null && newPath.Count > 0;
+
+        if (HasManualPath)
+            Debug.Log($"[TestPath] Manual path applied: {start.name} → {goal.name} " +
+                      $"({newPath.Count} waypoints). Will be used on next episode start.");
+    }
+
+    /// <summary>
+    /// Reverts to random path generation (clears minimap override).
+    /// Call this when you want training to resume with random routes.
+    /// </summary>
+    public void ClearManualPath()
+    {
+        HasManualPath = false;
+        Debug.Log("[TestPath] Manual path cleared – reverting to random generation.");
+    }
+
+    // ── Original code below (unchanged) ──────────────────────────────────────
+
+    void Awake()
+    {
+        if (waypointParent != null && waypointParent.childCount > 0)
+        {
+            allWaypoints = new List<Waypoint>();
+            foreach (Transform child in waypointParent)
+            {
+                Waypoint wp = child.GetComponent<Waypoint>();
+                if (wp != null)
+                    allWaypoints.Add(wp);
+            }
+        }
+    }
+
+    // Fixed path using inspector-assigned waypoints
+    public void GetFixedPath()
+    {
+        if (fixedStart == null || fixedGoal == null)
+        {
+            Debug.LogWarning("Fixed start or goal not assigned in inspector!");
+            return;
+        }
+
+        CurrentStart = fixedStart;
+        CurrentGoal = fixedGoal;
+
+        path = PathFinder.FindPathAStar(CurrentStart, CurrentGoal);
+
+        if (path == null)
+            Debug.LogWarning("No path found for fixed waypoints!");
+    }
+
+    /// <summary>
+    /// Generates a random A* path, UNLESS HasManualPath is true — in that case
+    /// the existing path (set by the minimap) is preserved and reused.
+    /// </summary>
+    public void GenerateRandomPath()
+    {
+        // ── Minimap override: skip random generation ──────────────────────────
+        if (HasManualPath)
+        {
+            // Path is already stored; CarAgent will reuse it.
+            // The agent is repositioned at path[0] by CarAgent.SelectPath().
+            return;
+        }
+
+        // ── Original random-path logic ────────────────────────────────────────
+        if (allWaypoints == null || allWaypoints.Count < 2)
+            return;
+
+        CurrentStart = allWaypoints[Random.Range(0, allWaypoints.Count)];
+        do
+        {
+            CurrentGoal = allWaypoints[Random.Range(0, allWaypoints.Count)];
+        } while (CurrentGoal == CurrentStart);
+
+        path = PathFinder.FindPathAStar(CurrentStart, CurrentGoal);
+
+        OnPathFound(path);
+
+        if (path == null)
+            Debug.Log("No path found!");
+    }
+
+    // If you had an OnPathFound callback in your original code, keep it here.
+    // (Remove this stub if not used.)
+    private void OnPathFound(List<Waypoint> foundPath) { }
+}
